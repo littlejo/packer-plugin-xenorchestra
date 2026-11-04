@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  # Called by release.yml, so a release is only built from a commit that
+  # passed the same gates.
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to check out and test (defaults to the triggering commit)
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: actions/setup-go@v7
+        with:
+          # Same version as mise.toml.
+          go-version: '1.27.3'
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "Not gofmt-ed:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: Check the generated code
+        run: |
+          go install github.com/hashicorp/packer-plugin-sdk/cmd/packer-sdc@v0.6.13
+          go generate ./...
+          git diff --exit-code
+
+      - name: Vet
+        run: |
+          go vet ./...
+          go vet -tags integration ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Test (race)
+        run: go test -race -count=1 ./...
+
+      # The plugin answers describe like Packer expects.
+      - name: Describe
+        run: |
+          go build -o packer-plugin-xenorchestra .
+          ./packer-plugin-xenorchestra describe

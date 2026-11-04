@@ -1,0 +1,37 @@
+version: 2
+
+project_name: packer-plugin-xenorchestra
+
+builds:
+  - id: plugin
+    main: .
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows, freebsd]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+      - -X github.com/littlejo/packer-plugin-xenorchestra/version.Version={{.Version}}
+      - -X github.com/littlejo/packer-plugin-xenorchestra/version.VersionPrerelease=
+    # The names `packer plugins install` and `opendango plugin pull` expect:
+    # packer-plugin-<name>_v<version>_x<api>_<os>_<arch>, API x5.0 for the
+    # SDK v0.6.x.
+    binary: '{{ .ProjectName }}_v{{ .Version }}_x5.0_{{ .Os }}_{{ .Arch }}'
+
+archives:
+  - formats: [zip]
+    files:
+      - none*
+    name_template: '{{ .ProjectName }}_v{{ .Version }}_x5.0_{{ .Os }}_{{ .Arch }}'
+
+checksum:
+  name_template: '{{ .ProjectName }}_v{{ .Version }}_SHA256SUMS'
+  algorithm: sha256
+
+changelog:
+  sort: asc
+
+release:
+  # Releases are drafts: a human reviews them before publishing.
+  draft: true
+  prerelease: auto

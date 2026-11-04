@@ -1,0 +1,7 @@
+.env
+/packer-plugin-xenorchestra
+/dist/
+# Editor swap files.
+*.swp
+*.swo
+*~
