@@ -8,8 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/packer-plugin-sdk/bootcommand"
 	"github.com/hashicorp/packer-plugin-sdk/multistep"
 	packersdk "github.com/hashicorp/packer-plugin-sdk/packer"
+	"github.com/hashicorp/packer-plugin-sdk/template/interpolate"
 )
 
 // State bag keys.
@@ -65,8 +67,28 @@ func (s *stepCreateVM) Run(ctx context.Context, state multistep.StateBag) multis
 	if c.memory > 0 {
 		body["memory"] = c.memory
 	}
+	newDisk := false
+	if c.ISO != "" {
+		iso, err := s.client.find(ctx, "vdis", "ISO", c.ISO, poolID)
+		if err != nil {
+			return halt(state, err)
+		}
+		body["install"] = map[string]any{"method": "cdrom", "repository": iso.ID}
+		// Started below, once the boot order is set.
+		body["boot"] = false
+		// A template such as "Other install media" has no disk to resize.
+		if newDisk, err = s.client.diskless(ctx, tmpl.ID); err != nil {
+			return halt(state, err)
+		}
+		if newDisk && c.disk == 0 {
+			return halt(state, fmt.Errorf("xenorchestra: template %s has no disk: set disk_size", tmpl.NameLabel))
+		}
+	}
 	if c.disk > 0 || c.SR != "" {
 		vdi := map[string]any{"userdevice": "0"}
+		if newDisk {
+			vdi = map[string]any{"name_label": c.VMName}
+		}
 		if c.disk > 0 {
 			vdi["size"] = c.disk
 		}
@@ -89,14 +111,16 @@ func (s *stepCreateVM) Run(ctx context.Context, state multistep.StateBag) multis
 	switch {
 	case c.CloudConfig != "":
 		body["cloud_config"] = c.CloudConfig
-	case c.generatesKey():
+	case c.injectsKey():
 		key := strings.TrimSpace(string(c.Comm.SSHPublicKey)) + " " + c.Comm.SSHTemporaryKeyPairName
 		body["cloud_config"] = cloudConfig(c.Comm.SSHUsername, key)
 	}
 	if body["cloud_config"] != nil {
 		// XO deletes the cloud-config drive once the VM has booted (or
-		// after 10 minutes): it is not left attached to the image.
-		body["destroy_cloud_config_vdi"] = true
+		// after 10 minutes): it is not left attached to the image. With
+		// iso, that would be during the installation: stepRemoveInstallMedia
+		// deletes it after the shutdown.
+		body["destroy_cloud_config_vdi"] = c.ISO == ""
 	}
 
 	ui.Say(fmt.Sprintf("Creating VM %s from template %s", c.VMName, tmpl.NameLabel))
@@ -110,6 +134,19 @@ func (s *stepCreateVM) Run(ctx context.Context, state multistep.StateBag) multis
 		return halt(state, fmt.Errorf("xenorchestra: create_vm returned no VM id"))
 	}
 	state.Put(stateVMID, created.ID)
+	// PopulateProvisionHookData reads it: the ID of the provision hook.
+	state.Put("instance_id", created.ID)
+	if c.ISO != "" {
+		// XO boots from the CD first, and installers cannot always eject
+		// it (Debian with UEFI cannot): disk first, the empty disk is
+		// skipped until the system is installed.
+		if err := s.client.setBootOrder(ctx, created.ID, "cd"); err != nil {
+			return halt(state, err)
+		}
+		if err := s.client.action(ctx, "/vms/"+url.PathEscape(created.ID), "start", nil, nil); err != nil {
+			return halt(state, err)
+		}
+	}
 	ui.Say("VM " + created.ID + " created and started")
 	return multistep.ActionContinue
 }
@@ -269,3 +306,115 @@ func (s *stepConvert) Cleanup(state multistep.StateBag) {
 		ui.Error(fmt.Sprintf("Error deleting template %s, delete it by hand: %s", id, err))
 	}
 }
+
+// stepHTTPIP sets the address the VM reaches the HTTP server at: http_ip,
+// or the address of this machine on the route to XO.
+type stepHTTPIP struct {
+	config *Config
+	client *Client
+}
+
+func (s *stepHTTPIP) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
+	if port, _ := state.Get("http_port").(int); port == 0 {
+		return multistep.ActionContinue
+	}
+	ip := s.config.HTTPIP
+	if ip == "" {
+		var err error
+		if ip, err = s.client.localAddr(ctx); err != nil {
+			return halt(state, err)
+		}
+	}
+	state.Put("http_ip", ip)
+	state.Get("ui").(packersdk.Ui).Say(fmt.Sprintf("HTTP server at http://%s:%d/", ip, state.Get("http_port")))
+	return multistep.ActionContinue
+}
+
+func (s *stepHTTPIP) Cleanup(multistep.StateBag) {}
+
+// bootCommandData is what boot_command can use: {{ .HTTPIP }},
+// {{ .HTTPPort }} and {{ .Name }}.
+type bootCommandData struct {
+	HTTPIP   string
+	HTTPPort int
+	Name     string
+}
+
+// stepBootCommand waits boot_wait, then types boot_command into the VM
+// console through XO.
+type stepBootCommand struct {
+	config *Config
+	client *Client
+}
+
+func (s *stepBootCommand) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
+	c := s.config
+	if len(c.BootCommand) == 0 || c.DisableVNC {
+		return multistep.ActionContinue
+	}
+	ui := state.Get("ui").(packersdk.Ui)
+	if c.BootWait > 0 {
+		ui.Say(fmt.Sprintf("Waiting %s for the boot", c.BootWait))
+		select {
+		case <-ctx.Done():
+			return halt(state, ctx.Err())
+		case <-time.After(c.BootWait):
+		}
+	}
+	ip, _ := state.Get("http_ip").(string)
+	port, _ := state.Get("http_port").(int)
+	c.ctx.Data = &bootCommandData{HTTPIP: ip, HTTPPort: port, Name: c.VMName}
+	command, err := interpolate.Render(c.FlatBootCommand(), &c.ctx)
+	if err != nil {
+		return halt(state, fmt.Errorf("boot_command: %w", err))
+	}
+	seq, err := bootcommand.GenerateExpressionSequence(command)
+	if err != nil {
+		return halt(state, fmt.Errorf("boot_command: %w", err))
+	}
+	cons, err := s.client.openConsole(ctx, state.Get(stateVMID).(string))
+	if err != nil {
+		return halt(state, err)
+	}
+	defer cons.Close()
+	ui.Say("Typing the boot command")
+	if err := seq.Do(ctx, bootcommand.NewVNCDriver(cons, c.BootKeyInterval)); err != nil {
+		return halt(state, fmt.Errorf("boot_command: %w", err))
+	}
+	return multistep.ActionContinue
+}
+
+func (s *stepBootCommand) Cleanup(multistep.StateBag) {}
+
+// stepRemoveInstallMedia ejects the ISO from the stopped VM and deletes
+// the cloud-config drive, which holds the SSH key (iso only).
+type stepRemoveInstallMedia struct {
+	client *Client
+}
+
+func (s *stepRemoveInstallMedia) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
+	ui := state.Get("ui").(packersdk.Ui)
+	if err := s.client.removeInstallMedia(ctx, state.Get(stateVMID).(string), ui.Say); err != nil {
+		return halt(state, err)
+	}
+	return multistep.ActionContinue
+}
+
+func (s *stepRemoveInstallMedia) Cleanup(multistep.StateBag) {}
+
+// stepExportXVA exports the stopped VM to xva_output.
+type stepExportXVA struct {
+	config *Config
+	client *Client
+}
+
+func (s *stepExportXVA) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
+	ui := state.Get("ui").(packersdk.Ui)
+	ui.Say("Exporting the XVA to " + s.config.XVAOutput)
+	if err := s.client.exportXVA(ctx, state.Get(stateVMID).(string), s.config.XVAOutput, s.config.XVACompress); err != nil {
+		return halt(state, err)
+	}
+	return multistep.ActionContinue
+}
+
+func (s *stepExportXVA) Cleanup(multistep.StateBag) {}

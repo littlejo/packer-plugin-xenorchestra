@@ -43,16 +43,23 @@ func (b *Builder) Run(ctx context.Context, ui packersdk.Ui, hook packersdk.Hook)
 	state := new(multistep.BasicStateBag)
 	state.Put("hook", hook)
 	state.Put("ui", ui)
+	// PopulateProvisionHookData reads it: the SSH settings and keys of the
+	// provision hook.
+	state.Put("communicator_config", &c.Comm)
 
 	var steps []multistep.Step
-	if c.generatesKey() {
+	if c.injectsKey() {
+		// It reads ssh_private_key_file when set, or creates a key.
 		if c.Comm.SSHTemporaryKeyPairType == "" {
 			c.Comm.SSHTemporaryKeyPairType = "ed25519"
 		}
 		steps = append(steps, &communicator.StepSSHKeyGen{CommConf: &c.Comm, SSHTemporaryKeyPair: c.Comm.SSHTemporaryKeyPair})
 	}
 	steps = append(steps,
+		commonsteps.HTTPServerFromHTTPConfig(&c.HTTPConfig),
 		&stepCreateVM{config: c, client: client},
+		&stepHTTPIP{config: c, client: client},
+		&stepBootCommand{config: c, client: client},
 		&stepWaitIP{config: c, client: client, poll: poll},
 		&communicator.StepConnect{
 			Config:    &c.Comm,
@@ -62,8 +69,14 @@ func (b *Builder) Run(ctx context.Context, ui packersdk.Ui, hook packersdk.Hook)
 		&commonsteps.StepProvision{},
 		&commonsteps.StepCleanupTempKeys{Comm: &c.Comm},
 		&stepShutdown{config: c, client: client, poll: poll},
-		&stepConvert{config: c, client: client, poll: poll},
 	)
+	if c.ISO != "" {
+		steps = append(steps, &stepRemoveInstallMedia{client: client})
+	}
+	if c.XVAOutput != "" {
+		steps = append(steps, &stepExportXVA{config: c, client: client})
+	}
+	steps = append(steps, &stepConvert{config: c, client: client, poll: poll})
 
 	b.runner = commonsteps.NewRunner(steps, c.PackerConfig, ui)
 	b.runner.Run(ctx, state)
@@ -81,5 +94,9 @@ func (b *Builder) Run(ctx context.Context, ui packersdk.Ui, hook packersdk.Hook)
 	if !ok {
 		return nil, errors.New("no template was created")
 	}
-	return &Artifact{client: client, id: id.(string), name: c.TemplateName}, nil
+	a := &Artifact{client: client, id: id.(string), name: c.TemplateName}
+	if c.XVAOutput != "" {
+		a.files = []string{c.XVAOutput}
+	}
+	return a, nil
 }

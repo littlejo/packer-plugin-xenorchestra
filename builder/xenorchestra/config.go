@@ -12,8 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/packer-plugin-sdk/bootcommand"
 	"github.com/hashicorp/packer-plugin-sdk/common"
 	"github.com/hashicorp/packer-plugin-sdk/communicator"
+	"github.com/hashicorp/packer-plugin-sdk/multistep/commonsteps"
 	packersdk "github.com/hashicorp/packer-plugin-sdk/packer"
 	"github.com/hashicorp/packer-plugin-sdk/shutdowncommand"
 	"github.com/hashicorp/packer-plugin-sdk/template/config"
@@ -24,6 +26,8 @@ import (
 // Config is the configuration of the builder.
 type Config struct {
 	common.PackerConfig            `mapstructure:",squash"`
+	commonsteps.HTTPConfig         `mapstructure:",squash"`
+	bootcommand.VNCConfig          `mapstructure:",squash"`
 	Comm                           communicator.Config `mapstructure:",squash"`
 	shutdowncommand.ShutdownConfig `mapstructure:",squash"`
 
@@ -60,15 +64,33 @@ type Config struct {
 	// the template's.
 	DiskSize string `mapstructure:"disk_size"`
 
+	// The name, id or UUID of an ISO (a VDI of an ISO SR of the pool) to
+	// install from. The VM is created with the ISO in its CD drive and boots
+	// on its disk first (the empty disk is skipped until the system is
+	// installed); a template without disks (such as "Other install media")
+	// gets a new disk, which needs `disk_size`. After the shutdown, the ISO
+	// is ejected and the cloud-config drive deleted.
+	ISO string `mapstructure:"iso"`
+	// The IP address the VM reaches the HTTP server at (`{{ .HTTPIP }}` in
+	// `boot_command`, `PackerHTTPIP`). Defaults to `http_bind_address` when
+	// set, otherwise to the address of this machine on the route to XO.
+	HTTPIP string `mapstructure:"http_ip"`
+
 	// The name of the VM. Defaults to `packer-<build name>-<timestamp>`.
 	VMName string `mapstructure:"vm_name"`
 	// The name of the template the VM becomes. Defaults to `vm_name`.
 	TemplateName string `mapstructure:"template_name"`
 	// The tags of the template.
 	Tags []string `mapstructure:"tags"`
+	// Export the VM as an XVA file at this path before the conversion to a
+	// template. It is the file of the artifact.
+	XVAOutput string `mapstructure:"xva_output"`
+	// The compression of the XVA: `zstd`, `gzip`, or none (the default).
+	XVACompress string `mapstructure:"xva_compress"`
 	// A cloud-config passed to the VM instead of the one the builder
-	// writes (which creates `ssh_username` with the temporary SSH key).
-	// With it, set `ssh_password` or `ssh_private_key_file`.
+	// writes (which creates `ssh_username` with the SSH key: a temporary
+	// one, or the public key of `ssh_private_key_file`). With it, set
+	// `ssh_password` or `ssh_private_key_file`.
 	CloudConfig string `mapstructure:"cloud_config"`
 	// How long to wait for the guest tools to report an IPv4 address.
 	// Defaults to `10m`.
@@ -87,7 +109,7 @@ func (c *Config) Prepare(raws ...any) ([]string, error) {
 		Interpolate:        true,
 		InterpolateContext: &c.ctx,
 		InterpolateFilter: &interpolate.RenderFilter{
-			Exclude: []string{"shutdown_command"},
+			Exclude: []string{"boot_command", "shutdown_command"},
 		},
 	}, raws...)
 	if err != nil {
@@ -142,18 +164,35 @@ func (c *Config) Prepare(raws ...any) ([]string, error) {
 	}
 
 	if c.Comm.Type == "ssh" || c.Comm.Type == "" {
-		if c.CloudConfig != "" && !c.hasSSHCredentials() {
-			errs = packersdk.MultiErrorAppend(errs, errors.New("with cloud_config, set ssh_password or ssh_private_key_file: the temporary SSH key is only written in the builder's cloud-config"))
+		if c.CloudConfig != "" && c.Comm.SSHPassword == "" && c.Comm.SSHPrivateKeyFile == "" && !c.Comm.SSHAgentAuth {
+			errs = packersdk.MultiErrorAppend(errs, errors.New("with cloud_config, set ssh_password or ssh_private_key_file: the SSH key is only written in the builder's cloud-config"))
 		}
-		if !c.hasSSHCredentials() && c.CloudConfig == "" {
-			// The temporary key is written by cloud-init with this
-			// comment, which StepCleanupTempKeys looks for.
+		if c.CloudConfig == "" && c.Comm.SSHPassword == "" && !c.Comm.SSHAgentAuth {
+			// The key (temporary, or the public key of ssh_private_key_file)
+			// is written by cloud-init with this comment, which
+			// StepCleanupTempKeys looks for.
 			if c.Comm.SSHTemporaryKeyPairName == "" {
 				c.Comm.SSHTemporaryKeyPairName = "packer_" + uuid.TimeOrderedUUID()
 			}
 			c.Comm.SSHClearAuthorizedKeys = true
 		}
 	}
+	if c.ISO != "" && c.CloudConfig == "" && !c.injectsKey() {
+		warnings = append(warnings, "iso without a cloud-config: the installed system must accept the SSH credentials by itself")
+	}
+	switch c.XVACompress {
+	case "", "zstd", "gzip":
+	default:
+		errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("xva_compress must be zstd or gzip, got %q", c.XVACompress))
+	}
+	if c.XVACompress != "" && c.XVAOutput == "" {
+		errs = packersdk.MultiErrorAppend(errs, errors.New("xva_compress needs xva_output"))
+	}
+	if c.HTTPIP == "" && c.HTTPAddress != "" && c.HTTPAddress != "0.0.0.0" {
+		c.HTTPIP = c.HTTPAddress
+	}
+	errs = packersdk.MultiErrorAppend(errs, c.HTTPConfig.Prepare(&c.ctx)...)
+	errs = packersdk.MultiErrorAppend(errs, c.VNCConfig.Prepare(&c.ctx)...)
 	errs = packersdk.MultiErrorAppend(errs, c.Comm.Prepare(&c.ctx)...)
 	errs = packersdk.MultiErrorAppend(errs, c.ShutdownConfig.Prepare(&c.ctx)...)
 
@@ -163,16 +202,11 @@ func (c *Config) Prepare(raws ...any) ([]string, error) {
 	return warnings, nil
 }
 
-// hasSSHCredentials tells whether the user gave a way to log in, in which
-// case no temporary key is created.
-func (c *Config) hasSSHCredentials() bool {
-	return c.Comm.SSHPassword != "" || c.Comm.SSHPrivateKeyFile != "" || c.Comm.SSHAgentAuth
-}
-
-// generatesKey tells whether the builder creates a temporary SSH key and
-// writes it with cloud-init.
-func (c *Config) generatesKey() bool {
-	return c.Comm.Type == "ssh" && c.CloudConfig == "" && !c.hasSSHCredentials()
+// injectsKey tells whether the builder writes an SSH public key with
+// cloud-init: a temporary one, or the one of ssh_private_key_file. It does
+// not with a password, an SSH agent or the user's cloud_config.
+func (c *Config) injectsKey() bool {
+	return c.Comm.Type == "ssh" && c.CloudConfig == "" && c.Comm.SSHPassword == "" && !c.Comm.SSHAgentAuth
 }
 
 var sizeRe = regexp.MustCompile(`^([0-9]+)\s*([KMGT]?)(IB|B)?$`)

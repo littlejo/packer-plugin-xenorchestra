@@ -3,8 +3,12 @@ package xenorchestra
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -178,4 +182,110 @@ func cloudConfig(user, authorizedKey string) string {
 	}
 	fmt.Fprintf(&b, "users:\n  - default\n  - name: %q\n    sudo: \"ALL=(ALL) NOPASSWD:ALL\"\n    ssh_authorized_keys:\n      - %q\n", user, authorizedKey)
 	return b.String()
+}
+
+// diskless tells whether a template has neither a disk nor a disk to
+// provision (template_info.disks).
+func (c *Client) diskless(ctx context.Context, templateID string) (bool, error) {
+	var t struct {
+		VBDs []string `json:"$VBDs"`
+		Info struct {
+			Disks []any `json:"disks"`
+		} `json:"template_info"`
+	}
+	err := c.do(ctx, http.MethodGet, "/vm-templates/"+url.PathEscape(templateID)+"?fields="+url.QueryEscape("$VBDs,template_info"), nil, &t)
+	return len(t.VBDs) == 0 && len(t.Info.Disks) == 0, err
+}
+
+// cloudConfigDrive is the name XO gives the cloud-config disk.
+const cloudConfigDrive = "XO CloudConfigDrive"
+
+// removeInstallMedia ejects the ISO from the stopped VM and deletes the
+// cloud-config disk. The CD drive stays: vm.convertToTemplate ejects it
+// too, from XO's cache (deleting the CD VBD instead breaks it).
+func (c *Client) removeInstallMedia(ctx context.Context, vmID string, say func(string)) error {
+	var vbds []struct {
+		VDI string `json:"VDI"`
+		CD  bool   `json:"is_cd_drive"`
+	}
+	path := "/vbds?fields=" + url.QueryEscape("VDI,is_cd_drive") + "&filter=" + url.QueryEscape("VM:"+vmID)
+	if err := c.do(ctx, http.MethodGet, path, nil, &vbds); err != nil {
+		return err
+	}
+	for _, vbd := range vbds {
+		switch {
+		case vbd.VDI == "":
+		case vbd.CD:
+			say("Ejecting the installation ISO")
+			if err := c.ejectCD(ctx, vmID); err != nil {
+				return fmt.Errorf("ejecting the ISO: %w", err)
+			}
+		default:
+			var vdi object
+			if err := c.do(ctx, http.MethodGet, "/vdis/"+url.PathEscape(vbd.VDI), nil, &vdi); err != nil {
+				return err
+			}
+			if vdi.NameLabel != cloudConfigDrive {
+				continue
+			}
+			say("Deleting the cloud-config disk")
+			if err := c.do(ctx, http.MethodDelete, "/vdis/"+url.PathEscape(vbd.VDI), nil, nil); err != nil {
+				return fmt.Errorf("deleting the cloud-config disk: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// exportXVA streams the export of the VM to a temporary file renamed to
+// dest on success.
+func (c *Client) exportXVA(ctx context.Context, vmID, dest, compress string) error {
+	p := "/vms/" + url.PathEscape(vmID) + ".xva"
+	if compress != "" {
+		p += "?compress=" + url.QueryEscape(compress)
+	}
+	resp, err := c.send(ctx, http.MethodGet, p, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dest), ".packer-*.xva")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := io.Copy(tmp, resp.Body); err != nil {
+		tmp.Close()
+		return fmt.Errorf("xenorchestra: downloading the XVA: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), dest)
+}
+
+// localAddr returns the IP address of this machine on the route to XO: the
+// address the VM most likely reaches it at. No packet is sent.
+func (c *Client) localAddr(ctx context.Context) (string, error) {
+	u, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return "", err
+	}
+	port := u.Port()
+	if port == "" {
+		port = "443"
+		if u.Scheme == "http" {
+			port = "80"
+		}
+	}
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "udp", net.JoinHostPort(u.Hostname(), port))
+	if err != nil {
+		return "", fmt.Errorf("finding the local address on the route to %s: %w", u.Host, err)
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP.String(), nil
 }

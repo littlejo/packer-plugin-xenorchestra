@@ -15,6 +15,17 @@ func (c *Client) convertToTemplate(ctx context.Context, vmID string) error {
 	return c.rpc(ctx, "vm.convertToTemplate", map[string]string{"id": vmID})
 }
 
+// setBootOrder calls vm.setBootOrder on the JSON-RPC API (HVM boot order:
+// c disk, d CD, n network). The REST API cannot change it.
+func (c *Client) setBootOrder(ctx context.Context, vmID, order string) error {
+	return c.rpc(ctx, "vm.setBootOrder", map[string]string{"vm": vmID, "order": order})
+}
+
+// ejectCD calls vm.ejectCd on the JSON-RPC API: the REST API cannot eject.
+func (c *Client) ejectCD(ctx context.Context, vmID string) error {
+	return c.rpc(ctx, "vm.ejectCd", map[string]string{"id": vmID})
+}
+
 // rpc signs in on the JSON-RPC API (WebSocket on /api/) and calls method.
 func (c *Client) rpc(ctx context.Context, method string, params any) error {
 	wsURL := "ws" + strings.TrimPrefix(c.BaseURL, "http") + "/api/"
