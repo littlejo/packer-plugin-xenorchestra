@@ -2,7 +2,7 @@ module github.com/littlejo/packer-plugin-xenorchestra
 
 go 1.26.10
 
-replace github.com/zclconf/go-cty => github.com/nywilken/go-cty v1.13.3
+replace github.com/zclconf/go-cty => github.com/nywilken/go-cty/v2 v2.0.0
 
 require (
 	github.com/coder/websocket v1.8.15
