@@ -1,7 +1,7 @@
 [tools]
 # Same version as the CI (.github/workflows/ci.yml).
 go = "1.27.3"
-goreleaser = "2.19.0"
+goreleaser = "2.20.0"
 
 [tasks.build]
 description = "Build the plugin binary"
