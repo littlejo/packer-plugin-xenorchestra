@@ -1,6 +1,6 @@
 [tools]
 # Same version as the CI (.github/workflows/ci.yml).
-go = "1.27.3"
+go = "1.27.4"
 goreleaser = "2.19.0"
 
 [tasks.build]
